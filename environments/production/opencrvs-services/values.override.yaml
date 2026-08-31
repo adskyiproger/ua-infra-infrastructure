@@ -1,0 +1,11 @@
+##################################################################################
+# Use this file to customize helm chart behavior
+# Please make sure your custom changes doesn't conflict with values.yaml
+##################################################################################
+auth:
+  env:
+    TWO_FA_ENABLED: false
+
+events:
+  env:
+    TWO_FA_ENABLED: false
