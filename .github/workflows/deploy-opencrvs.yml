@@ -1,0 +1,191 @@
+name: 03. Deploy OpenCRVS
+run-name: "Deploy OpenCRVS on ${{ inputs.environment }} (core: ${{ inputs.core-image-tag }}, country: ${{ inputs.countryconfig-image-tag }})"
+on:
+  workflow_call:
+    inputs:
+      core-image-tag:
+        type: string
+      countryconfig-image-tag:
+        type: string
+      data-seed-enabled:
+        type: boolean
+      environment:
+        type: string
+  workflow_dispatch:
+    inputs:
+      core-image-tag:
+        description: "Tag of the core image"
+        required: true
+        default: "v2.0.1"
+      countryconfig-image-tag:
+        description: "Tag of the countryconfig image"
+        required: true
+        default: "v2.0.1"
+      data-seed-enabled:
+        description: "Data seeding during deployment"
+        required: false
+        default: "false"
+        type: boolean
+      environment:
+        description: "Target environment"
+        required: true
+        default: "development"
+        type: choice
+        options:
+          - ""
+
+env:
+  # Assuming chart version matches core image tag
+  OPENCRVS_CHART_VERSION: "v2.0.1"
+jobs:
+  approve:
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Waiting for manual approval
+        if: ${{ (vars.APPROVAL_REQUIRED || 'false') == 'true' }}
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ vars.GH_APPROVERS }}
+          minimum-approvals: 1
+          issue-title: >
+            Deploy (${{ inputs.environment }}): core: ${{ inputs.core-image-tag }} 
+            country config: ${{ inputs.countryconfig-image-tag }}
+
+          issue-body: >
+            Please approve or deny the deployment of core: ${{ inputs.core-image-tag }} 
+            country config: ${{ inputs.countryconfig-image-tag }} to ${{ inputs.environment }} 
+            initiated from GitHub Actions by @${{ github.actor }}.
+
+          exclude-workflow-initiator-as-approver: false
+
+  github-to-k8s-sync-env:
+    needs: approve
+    uses: ./.github/workflows/github-to-k8s-sync-env.yml
+    with:
+      environment: ${{ inputs.environment }}
+    secrets: inherit
+  deploy:
+    needs: github-to-k8s-sync-env
+    environment: ${{ inputs.environment }}
+    env:
+      ENV: ${{ inputs.environment }}
+      BRANCH: ${{ github.ref_name }}
+      GITHUB_ACTOR: ${{ github.actor }}
+      CORE_IMAGE_TAG: ${{ inputs.core-image-tag }}
+      COUNTRYCONFIG_IMAGE_TAG: ${{ inputs.countryconfig-image-tag }}
+      COUNTRYCONFIG_IMAGE_NAME: ${{ secrets.DOCKERHUB_ACCOUNT || 'opencrvs' }}/${{ secrets.DOCKERHUB_REPO || 'ocrvs-farajaland'}}
+      SENDER_EMAIL_ADDRESS: ${{ secrets.SENDER_EMAIL_ADDRESS }}
+      ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+    runs-on:
+      - self-hosted
+      - k8s
+      - ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Generate summary
+        env:
+          PUBLIC_DOMAIN: ${{ vars.DOMAIN }}
+        run: |
+          RESET="${{ inputs.reset }}"
+          if [ "$RESET" = "true" ]; then
+            RESET_MARK="<span style='color:green'>⚠️ Yes</span>"
+          else
+            RESET_MARK="<span style='color:red'>✅ No</span>"
+          fi
+          SUMMARY=$(cat <<EOF
+          ### Deployment Summary
+
+          | Key | Value |
+          |-----|-------|
+          | Environment URL | https://$PUBLIC_DOMAIN |
+          | Core image tag | \`${{ inputs.core-image-tag }}\` |
+          | Country config image | \`${{ inputs.countryconfig-image-tag }}\` |
+          | Branch name | \`${{ github.ref_name }}\` |
+          | Reset environment | $RESET_MARK |
+          EOF
+          )
+          echo "$SUMMARY" | sed 's/^          //' >> $GITHUB_STEP_SUMMARY
+      - name: Create namespace
+        run: kubectl create namespace "opencrvs-${ENV}" || true
+      - name: Copy secrets from dependencies into application namespace
+        # Only redis secret for now needs to be copied
+        run: |
+          secrets=(
+            "elasticsearch-admin-user"
+            "redis-opencrvs-users"
+            "minio-opencrvs-users"
+            "mongodb-admin-user"
+            "postgres-admin-user"
+          )
+          for secret in "${secrets[@]}"; do
+            kubectl get secret $secret -n opencrvs-deps-${ENV} -o yaml \
+            | sed "s#namespace: opencrvs-deps-${ENV}#namespace: opencrvs-${ENV}#" \
+            | grep -vE 'resourceVersion|uid|creationTimestamp' \
+            | kubectl apply -n opencrvs-${ENV} -f - \
+            || echo "Secret $secret doesn't exist in opencrvs-deps-${ENV} namespace"
+          done
+
+      - name: Deploy with Helm
+        id: deploy
+        run: |
+          stern -n "opencrvs-${ENV}" \
+            --since 1s \
+            --tail 0 \
+            --exclude 'kube-probe' \
+            --exclude '"level":(30|info)' \
+            --template '{{.PodName}}/{{.ContainerName}} | {{.Message}}{{"\n"}}' \
+            . &
+          STERN_PID=$!
+          touch environments/${ENV}/opencrvs-services/values.override.yaml
+          helm upgrade --install opencrvs oci://ghcr.io/opencrvs/opencrvs-services:${OPENCRVS_CHART_VERSION} \
+            --timeout 15m \
+            --namespace "opencrvs-${ENV}" \
+            -f environments/${ENV}/opencrvs-services/values.yaml \
+            -f environments/${ENV}/opencrvs-services/values.override.yaml \
+            --create-namespace \
+            --atomic \
+            --wait \
+            --wait-for-jobs \
+            --set-string platform.tag="$CORE_IMAGE_TAG" \
+            --set-string countryconfig.image.tag="$COUNTRYCONFIG_IMAGE_TAG" \
+            --set countryconfig.image.name="$COUNTRYCONFIG_IMAGE_NAME" \
+            --set data_seed.env.ACTIVATE_USERS="${{ vars.ACTIVATE_USERS || 'false' }}" \
+            --set data_seed.enabled="${{ inputs.data-seed-enabled }}" \
+            --set env.CONTENT_SECURITY_POLICY_WILDCARD="${{ vars.CONTENT_SECURITY_POLICY_WILDCARD }}" \
+            --set hostname=${{ vars.DOMAIN }} 2>&1 ; STATUS=$?;
+
+            kill $STERN_PID 2>/dev/null || true
+            exit $STATUS
+      - name: Cleanup Helm Locks
+        if: failure() || cancelled()
+        run: |
+          kubectl -n "opencrvs-${ENV}" get secrets -l owner=helm -o json | \
+          jq -r '.items[] | select(.metadata.labels.status=="pending-install" or .metadata.labels.status=="pending-upgrade" or .metadata.labels.status=="pending-rollback") | .metadata.name' | \
+          xargs -r kubectl -n "opencrvs-${ENV}" delete secret || \
+          echo "No helm locks found, all is good"
+      - name: Send email
+        if: always()
+        run: |
+          echo "OpenCRVS deployment status: ${{ steps.deploy.outcome }}"
+          subject="🚀 OpenCRVS deployment to '$ENV' completed successfully"
+          if [ "${{ steps.deploy.outcome }}" == 'failure' ]; then
+            subject="⚠️ OpenCRVS deployment to '$ENV' has failed"
+          fi
+          EMAIL_PAYLOAD="{
+            \"subject\": \"$subject\",
+            \"html\": \"${subject} with images '$CORE_IMAGE_TAG' for core and '$COUNTRYCONFIG_IMAGE_TAG' for country config.<br/>Deployed by GitHub user: @${GITHUB_ACTOR}\",
+            \"from\": \"${SENDER_EMAIL_ADDRESS}\",
+            \"to\": \"${ALERT_EMAIL}\"
+          }"
+
+          curl -X POST http://countryconfig.opencrvs-$ENV.svc.cluster.local:3040/email \
+               -H 'Content-Type: application/json' \
+               -d "$EMAIL_PAYLOAD" \
+               --connect-timeout 5 \
+               --max-time 10 \
+               --fail \
+               --silent \
+               --show-error || echo "Error: Failed to reach countryconfig service"

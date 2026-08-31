@@ -1,0 +1,11 @@
+node_modules/
+.env.*
+dump.temporal.env
+.terraform
+.terraform.lock.hcl
+*.tfvars
+*.tfstate
+*.tfstate.backup
+vars
+TODO.md
+.ssh

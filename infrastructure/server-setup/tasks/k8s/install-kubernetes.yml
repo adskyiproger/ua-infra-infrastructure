@@ -1,0 +1,46 @@
+- name: Create keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Kubernetes APT key
+  get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/Release.key"
+    dest: /tmp/kubernetes.key
+    mode: '0644'
+
+- name: Convert and install Kubernetes APT key
+  ansible.builtin.shell: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes.key
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/ /"
+    filename: kubernetes
+    state: present
+
+- name: Install specific Kubernetes version
+  become: yes
+  ansible.builtin.apt:
+    update_cache: yes
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: latest
+
+- name: Enable kubelet service
+  become: yes
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: yes
+
+- name: 'Copy logrotate script'
+  ansible.builtin.copy:
+    src: ./files/logrotate-cryptfs.conf
+    dest: /etc/logrotate.d/opencrvs-cryptfs
+    mode: "0644"
+    owner: root
+    group: root

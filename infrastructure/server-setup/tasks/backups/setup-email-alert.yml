@@ -1,0 +1,26 @@
+- name: Install auditd
+  apt:
+    name: auditd
+    state: present
+    update_cache: yes
+
+- name: Add login-alert configuration
+  template:
+    src: login-alert.conf.j2
+    dest: "/etc/login-alert.conf"
+    mode: '0600'
+
+- name: Install login-alert.sh script
+  copy:
+    src: ./files/login-alert.sh
+    dest: "/usr/local/bin/login-alert.sh"
+    owner: "root"
+    group: 'root'
+    mode: '0755'
+
+- name: Setup cronjob for login monitoring
+  cron:
+    name: "Login alert cronjob"
+    user: root
+    minute: "*"
+    job: "/usr/local/bin/login-alert.sh"

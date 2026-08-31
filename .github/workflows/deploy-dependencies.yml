@@ -1,0 +1,113 @@
+name: 02. Deploy Dependencies
+run-name: Deploy Dependencies on ${{ inputs.environment }}
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "development"
+        type: choice
+        options:
+          - ""
+env:
+  DEPENDENCIES_CHART_VERSION: "v2.0.1"
+  TRAEFIK_CHART_VERSION: "39.0.0"
+jobs:
+  approve:
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Waiting for manual approval
+        if: ${{ (vars.APPROVAL_REQUIRED || 'false') == 'true' }}
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ vars.GH_APPROVERS }}
+          minimum-approvals: 1
+          issue-title: "Deploy dependencies (${{ inputs.environment }})"
+          issue-body: >
+            Please approve or deny the OpenCRVS dependencies deployment to ${{ inputs.environment }}
+            initiated from GitHub Actions by @${{ github.actor }}.
+          exclude-workflow-initiator-as-approver: false
+
+  github-to-k8s-sync-env:
+    needs: approve
+    uses: ./.github/workflows/github-to-k8s-sync-env.yml
+    with:
+      environment: ${{ inputs.environment }}
+      namespace_template: "opencrvs-deps"
+    secrets: inherit
+
+  deploy:
+    needs: 'github-to-k8s-sync-env'
+    environment: ${{ inputs.environment }}
+    runs-on:
+      - self-hosted
+      - k8s
+      - ${{ inputs.environment }}
+    env:
+      ENV: ${{ inputs.environment }}
+      GITHUB_ACTOR: ${{ github.actor }}
+      SENDER_EMAIL_ADDRESS: ${{ secrets.SENDER_EMAIL_ADDRESS }}
+      ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Traefik
+        run: |
+          touch environments/${ENV}/traefik/values.override.yaml
+          kubectl scale deployment traefik --replicas=0 --namespace traefik || true
+          helm upgrade --install traefik oci://ghcr.io/traefik/helm/traefik:${TRAEFIK_CHART_VERSION} \
+            --namespace traefik \
+            --create-namespace \
+            -f environments/${ENV}/traefik/values.yaml \
+            -f environments/${ENV}/traefik/values.override.yaml
+          kubectl scale deployment traefik --replicas=1 --namespace traefik || true
+
+      - name: Install OpenCRVS dependencies
+        id: deploy
+        run: |
+          stern -n "opencrvs-deps-${ENV}" \
+            --since 1s \
+            --tail 0 \
+            --exclude 'kube-probe' \
+            --exclude '"level":(30|info)' \
+            --template '{{.PodName}}/{{.ContainerName}} | {{.Message}}{{"\n"}}' \
+            . &
+          STERN_PID=$!
+          touch environments/${ENV}/dependencies/values.override.yaml
+          helm upgrade --install opencrvs-deps oci://ghcr.io/opencrvs/opencrvs-dependencies-chart:${DEPENDENCIES_CHART_VERSION} \
+            --namespace "opencrvs-deps-${ENV}" \
+            -f environments/${ENV}/dependencies/values.yaml \
+            -f environments/${ENV}/dependencies/values.override.yaml \
+            --create-namespace \
+            --timeout 15m \
+            --set hostname=${{ vars.DOMAIN }} \
+            --atomic; STATUS=$?;
+
+          kill $STERN_PID 2>/dev/null || true
+          exit $STATUS
+      - name: Send email
+        if: always()
+        run: |
+          subject="🚀 OpenCRVS dependencies deployment to '$ENV' completed successfully"
+          if [ "${{ steps.deploy.outcome }}" == 'failure' ]; then
+            subject="⚠️ OpenCRVS deployment to '$ENV' has failed"
+          fi
+          EMAIL_PAYLOAD="{
+            \"subject\": \"$subject\",
+            \"html\": \"${subject}<br/>Deployed by GitHub user: @${GITHUB_ACTOR}\",
+            \"from\": \"${SENDER_EMAIL_ADDRESS}\",
+            \"to\": \"${ALERT_EMAIL}\"
+          }"
+
+          curl -X POST http://countryconfig.opencrvs-$ENV.svc.cluster.local:3040/email \
+               -H 'Content-Type: application/json' \
+               -d "$EMAIL_PAYLOAD" \
+               --connect-timeout 5 \
+               --max-time 10 \
+               --fail \
+               --silent \
+               --show-error || echo "Error: Failed to reach countryconfig service"
