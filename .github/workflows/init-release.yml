@@ -63,7 +63,7 @@ jobs:
 
       # Full history is required so yarn can traverse the commit graph.
       - name: Checkout ${{ steps.get_base_branch.outputs.base_branch }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.get_base_branch.outputs.base_branch }}
           fetch-depth: 0
@@ -101,8 +101,6 @@ jobs:
           sed -i \
             -e "s/^\(\s*DEPENDENCIES_CHART_VERSION:\s*\).*/\1\"v$VERSION\"/" \
             .github/workflows/deploy-dependencies.yml
-          # Bump package.json without creating a git tag.
-          yarn version --new-version ${{ inputs.version }} --no-git-tag-version
           git add .
           git commit -m "chore: update version to ${{ inputs.version }}"
 
