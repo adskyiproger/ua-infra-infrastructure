@@ -13,7 +13,8 @@ on:
         default: "development"
         required: true
         options:
-          - ""
+          - staging
+          - production
 jobs:
   approve:
     environment: ${{ inputs.environment }}
